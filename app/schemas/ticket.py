@@ -67,6 +67,7 @@ class TicketRead(BaseModel):
     impact: str | None
     assigned_team: str | None
     classification_confidence: float | None
+    classification_reason: str | None
 
     retrieved_documents: list | None
     suggested_resolution: str | None

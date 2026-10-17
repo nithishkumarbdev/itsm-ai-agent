@@ -50,6 +50,7 @@ class Ticket(Base):
     impact: Mapped[str | None] = mapped_column(String(20))
     assigned_team: Mapped[str | None] = mapped_column(String(100))
     classification_confidence: Mapped[float | None] = mapped_column(Float)
+    classification_reason: Mapped[str | None] = mapped_column(Text)
 
     # --- retrieval / resolution ---
     retrieved_documents: Mapped[list | None] = mapped_column(JSON)

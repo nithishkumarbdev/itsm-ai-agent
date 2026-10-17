@@ -4,12 +4,15 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.api.deps import get_classification_service
 from app.audit import record_event
 from app.db.database import get_db
 from app.lifecycle import change_status
-from app.models import AuditEvent, AuditEventType, Ticket, TicketStatus
+from app.models import AuditEvent, AuditEventType, Ticket
 from app.schemas.audit_event import AuditEventRead
 from app.schemas.ticket import StatusUpdate, TicketCreate, TicketRead
+from app.services.classification import ClassificationService
+from app.workflow import run_processing
 
 router = APIRouter(prefix="/tickets", tags=["tickets"])
 
@@ -80,23 +83,26 @@ def update_ticket_status(ticket_id: uuid.UUID, payload: StatusUpdate, db: Sessio
     response_model=TicketRead,
     responses={**NOT_FOUND, **INVALID_TRANSITION},
 )
-def process_ticket(ticket_id: uuid.UUID, db: Session = Depends(get_db)):
-    """Entry point for ticket processing.
+def process_ticket(
+    ticket_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    classifier: ClassificationService = Depends(get_classification_service),
+):
+    """Process a ticket: move it to `processing`, classify it with the LLM, then route it.
 
-    For now it only moves the ticket to `processing` and records that processing began.
-    No AI runs here yet.
+    The LLM only proposes the classification. The team (`assigned_team`) is chosen by
+    deterministic backend rules from the validated category; clients cannot set it.
+
+    Success: the ticket is returned with its classification and `assigned_team`, and stays
+    in `processing`.
+
+    If classification (or routing) fails the response is still 200 with the ticket, but it
+    has no classification and no team, and its status is `awaiting_human`. The reason is in
+    the ticket's audit events (`classification_failed` / `routing_failed`).
+    Nothing else happens yet: no retrieval, no resolution.
     """
     ticket = get_ticket_or_404(db, ticket_id, lock=True)
-    change_status(db, ticket, TicketStatus.PROCESSING)
-    record_event(
-        db,
-        ticket.id,
-        AuditEventType.PROCESSING_STARTED,
-        "Ticket processing started",
-    )
-    db.commit()
-    db.refresh(ticket)
-    return ticket
+    return run_processing(db, ticket, classifier)
 
 
 @router.get("/{ticket_id}/events", response_model=list[AuditEventRead], responses=NOT_FOUND)

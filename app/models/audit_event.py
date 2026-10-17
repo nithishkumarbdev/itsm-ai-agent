@@ -15,6 +15,10 @@ class AuditEventType(StrEnum):
     TICKET_CREATED = "ticket_created"
     STATUS_CHANGED = "status_changed"
     PROCESSING_STARTED = "processing_started"
+    CLASSIFICATION_COMPLETED = "classification_completed"
+    CLASSIFICATION_FAILED = "classification_failed"
+    ROUTING_DECIDED = "routing_decided"
+    ROUTING_FAILED = "routing_failed"
 
 
 class AuditEvent(Base):
