@@ -25,12 +25,14 @@ if not (_parsed.database or "").endswith("_test"):
 # Real environment variables beat .env, so the app itself now talks to the test database.
 os.environ["DATABASE_URL"] = _test_url
 
+import copy  # noqa: E402
 import uuid  # noqa: E402
 
 from fastapi.testclient import TestClient  # noqa: E402
 from sqlalchemy import create_engine, select  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 
+from app.api.deps import get_llm_client  # noqa: E402
 from app.db.database import Base, SessionLocal, engine, get_db  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import AuditEvent, Ticket  # noqa: E402
@@ -45,14 +47,70 @@ def fresh_schema():
     Base.metadata.drop_all(bind=engine)
 
 
+DEFAULT_CLASSIFICATION = {
+    "category": "vpn",
+    "priority": "P2",
+    "urgency": "high",
+    "impact": "individual",
+    "confidence": 0.91,
+    "reason": "The ticket describes a failure to connect to the corporate VPN.",
+}
+
+
+class MockLLMClient:
+    """Stands in for the real LLM in every test. It is not part of the app on purpose,
+    so production code can never end up using fake classifications.
+
+    By default it returns a valid VPN classification. Tests change that with returns(),
+    returns_raw() or fails_with(), and inspect what the service sent via `calls`.
+    """
+
+    name = "mock"
+
+    def __init__(self):
+        self.calls = []
+        self.response = copy.deepcopy(DEFAULT_CLASSIFICATION)
+        self.error = None
+        self.before_return = None  # optional hook: runs while the "LLM call" is in progress
+
+    def returns(self, **overrides):
+        """Valid classification with some fields replaced."""
+        self.response = {**DEFAULT_CLASSIFICATION, **overrides}
+
+    def returns_raw(self, raw):
+        """Exactly this output, however malformed."""
+        self.response = raw
+
+    def fails_with(self, error):
+        self.error = error
+
+    def generate_structured(self, *, system, user, schema_name, schema):
+        self.calls.append(
+            {"system": system, "user": user, "schema_name": schema_name, "schema": schema}
+        )
+        if self.before_return:
+            self.before_return()
+        if self.error:
+            raise self.error
+        return copy.deepcopy(self.response)
+
+
 @pytest.fixture()
-def client():
-    """Client that uses the app's real database dependency, pointed at the test database.
+def llm():
+    return MockLLMClient()
+
+
+@pytest.fixture()
+def client(llm):
+    """Client that uses the app's real database dependency, pointed at the test database,
+    and the mock LLM instead of a real provider.
 
     Not used as a context manager on purpose: the schema is managed by fresh_schema.
     (The startup hook itself is tested separately.)
     """
-    return TestClient(app)
+    app.dependency_overrides[get_llm_client] = lambda: llm
+    yield TestClient(app)
+    app.dependency_overrides.pop(get_llm_client, None)
 
 
 @pytest.fixture()
@@ -64,7 +122,7 @@ def db():
 
 
 @pytest.fixture()
-def unreachable_client():
+def unreachable_client(llm):
     """Client whose database is genuinely unreachable (nothing listens on port 1)."""
     dead_engine = create_engine(
         "postgresql+psycopg://nobody:nobody@127.0.0.1:1/nodb",
@@ -80,6 +138,7 @@ def unreachable_client():
             session.close()
 
     app.dependency_overrides[get_db] = dead_get_db
+    app.dependency_overrides[get_llm_client] = lambda: llm
     yield TestClient(app)
     app.dependency_overrides.clear()
     dead_engine.dispose()
@@ -136,3 +195,14 @@ def event_types_of(db):
         return list(db.scalars(stmt))
 
     return _event_types_of
+
+
+@pytest.fixture()
+def row_of(db):
+    """row_of(ticket_id): the Ticket row as stored in PostgreSQL right now (not via the API)."""
+
+    def _row(ticket_id):
+        db.expire_all()
+        return db.get(Ticket, uuid.UUID(str(ticket_id)))
+
+    return _row

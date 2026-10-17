@@ -53,6 +53,7 @@ def test_ai_fields_are_empty_after_creation(client):
         "impact",
         "assigned_team",
         "classification_confidence",
+        "classification_reason",
         "retrieved_documents",
         "suggested_resolution",
         "resolution_confidence",

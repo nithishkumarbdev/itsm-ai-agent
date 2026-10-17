@@ -43,6 +43,8 @@ def test_events_are_returned_in_chronological_order(client, ticket):
         "ticket_created",
         "status_changed",
         "processing_started",
+        "classification_completed",  # /process now classifies too (Phase 3)
+        "routing_decided",  # ...and routes (Phase 4)
         "status_changed",
         "status_changed",
     ]

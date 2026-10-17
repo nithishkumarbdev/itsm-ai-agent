@@ -5,7 +5,8 @@ import uuid
 import pytest
 from sqlalchemy import func, select
 
-from app.models import AuditEvent, Ticket
+from app.audit import record_event as real_record_event
+from app.models import AuditEvent, AuditEventType, Ticket
 
 SOME_ID = "00000000-0000-0000-0000-000000000000"
 
@@ -64,13 +65,42 @@ def test_process_is_rolled_back_if_the_second_audit_event_fails(
     client, ticket, status_of, event_types_of, monkeypatch
 ):
     # status_changed is written by the lifecycle; only the processing_started write fails.
-    monkeypatch.setattr("app.api.routes.tickets.record_event", orphan_event)
+    monkeypatch.setattr("app.workflow.record_event", orphan_event)
 
     response = client.post(f"/tickets/{ticket['id']}/process")
 
     assert_generic_500(response)
     assert status_of(ticket["id"]) == "new"
     assert event_types_of(ticket["id"]) == ["ticket_created"]  # status_changed rolled back too
+
+
+@pytest.mark.parametrize(
+    "failing_event",
+    [AuditEventType.CLASSIFICATION_COMPLETED, AuditEventType.ROUTING_DECIDED],
+    ids=["classification_completed-fails", "routing_decided-fails"],
+)
+def test_classification_and_routing_are_saved_together_or_not_at_all(
+    client, ticket, row_of, event_types_of, monkeypatch, failing_event
+):
+    """Classification fields, team and both audit events commit in one transaction:
+    if either audit write fails, none of it is saved."""
+
+    def fail_only_for_one_event(db, ticket_id, event_type, message, details=None):
+        if event_type == failing_event:
+            orphan_event(db, ticket_id, event_type, message, details)
+        else:
+            real_record_event(db, ticket_id, event_type, message, details)
+
+    monkeypatch.setattr("app.workflow.record_event", fail_only_for_one_event)
+
+    response = client.post(f"/tickets/{ticket['id']}/process")
+
+    assert_generic_500(response)
+    row = row_of(ticket["id"])
+    assert row.status == "processing"  # step 1 had already committed
+    assert row.category is None and row.classification_confidence is None  # nothing partial saved
+    assert row.assigned_team is None  # no team without its classification, and vice versa
+    assert event_types_of(ticket["id"]) == ["ticket_created", "status_changed", "processing_started"]
 
 
 # ---------- database unreachable ----------
@@ -84,8 +114,12 @@ def test_process_is_rolled_back_if_the_second_audit_event_fails(
         ("POST", f"/tickets/{SOME_ID}/status", {"status": "processing"}),
         ("POST", f"/tickets/{SOME_ID}/process", None),
         ("GET", f"/tickets/{SOME_ID}/events", None),
+        ("GET", "/knowledge", None),
+        ("GET", f"/knowledge/{SOME_ID}", None),
+        ("PATCH", f"/knowledge/{SOME_ID}", {"is_active": False}),
+        ("POST", "/knowledge", {"title": "VPN Guide", "category": "vpn", "content": "## Symptoms\n- The VPN keeps dropping."}),
     ],
-    ids=["list", "get", "status", "process", "events"],
+    ids=["list", "get", "status", "process", "events", "kb-list", "kb-get", "kb-patch", "kb-create"],
 )
 def test_unreachable_database_returns_503_without_leaking_details(unreachable_client, method, path, body):
     response = unreachable_client.request(method, path, json=body)

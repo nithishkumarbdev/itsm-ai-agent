@@ -6,6 +6,10 @@ EXPECTED_ENDPOINTS = {
     ("/tickets/{ticket_id}/status", "post"),
     ("/tickets/{ticket_id}/process", "post"),
     ("/tickets/{ticket_id}/events", "get"),
+    ("/knowledge", "get"),
+    ("/knowledge", "post"),
+    ("/knowledge/{document_id}", "get"),
+    ("/knowledge/{document_id}", "patch"),
 }
 
 
@@ -16,9 +20,9 @@ def test_docs_and_openapi_are_served(client):
     assert response.status_code == 200
     spec = response.json()
 
-    # Exactly these endpoints: nothing extra, in particular no PUT/PATCH/DELETE.
+    # Exactly these endpoints: nothing extra. No DELETE anywhere, and no search/embed endpoints yet.
     actual = {(path, method) for path, operations in spec["paths"].items() for method in operations}
     assert actual == EXPECTED_ENDPOINTS
-    assert {"TicketCreate", "TicketRead", "StatusUpdate", "AuditEventRead"} <= set(
+    assert {"TicketCreate", "TicketRead", "StatusUpdate", "AuditEventRead", "KnowledgeDocumentCreate", "KnowledgeDocumentRead", "KnowledgeDocumentSummary", "KnowledgeDocumentUpdate"} <= set(
         spec["components"]["schemas"]
     )

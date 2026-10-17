@@ -133,19 +133,23 @@ def test_process_moves_ticket_to_processing_and_records_events(
     body = response.json()
     assert body["status"] == "processing"
     assert status_of(ticket["id"]) == "processing"
-    assert event_types_of(ticket["id"]) == ["ticket_created", "status_changed", "processing_started"]
-    started = client.get(f"/tickets/{ticket['id']}/events").json()[-1]
+    assert event_types_of(ticket["id"]) == [
+        "ticket_created",
+        "status_changed",
+        "processing_started",
+        "classification_completed",  # added in Phase 3
+        "routing_decided",  # added in Phase 4
+    ]
+    events = client.get(f"/tickets/{ticket['id']}/events").json()
+    started = next(e for e in events if e["event_type"] == "processing_started")
     assert started["message"] == "Ticket processing started"
 
 
-def test_process_does_not_fake_any_ai_output(client, ticket):
+def test_process_only_fills_classification_fields_not_later_phases(client, ticket):
+    """Classification and routing exist; retrieval, resolution and policy fields must stay empty."""
     body = client.post(f"/tickets/{ticket['id']}/process").json()
 
     for field in [
-        "category",
-        "priority",
-        "assigned_team",
-        "classification_confidence",
         "retrieved_documents",
         "suggested_resolution",
         "resolution_confidence",
