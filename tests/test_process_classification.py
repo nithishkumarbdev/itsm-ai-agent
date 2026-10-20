@@ -83,6 +83,7 @@ def test_classification_completed_event_belongs_to_the_ticket_and_has_concise_de
         "processing_started",
         "classification_completed",
         "routing_decided",
+        "knowledge_retrieved",
     ]
     completed = events[3]
     assert completed["ticket_id"] == ticket["id"]
@@ -144,9 +145,9 @@ def test_processing_never_resolves_or_decides_anything_beyond_routing(client, ro
     body = process(client, ticket["id"])
 
     assert body["status"] == "processing"  # not resolved, however confident
-    assert body["assigned_team"] == "Access Management"  # routing is the last step for now
+    assert body["assigned_team"] == "Access Management"
+    assert body["retrieved_documents"] == []  # retrieval ran; nothing is indexed in this test
     for field in [
-        "retrieved_documents",
         "suggested_resolution",
         "resolution_confidence",
         "auto_resolution_eligible",
@@ -176,6 +177,7 @@ def test_injection_text_in_a_ticket_is_sent_as_data_and_changes_nothing_else(cli
         "processing_started",
         "classification_completed",
         "routing_decided",
+        "knowledge_retrieved",
     ]
 
 

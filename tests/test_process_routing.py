@@ -62,6 +62,7 @@ def test_ticket_is_routed_persisted_and_audited(client, row_of, llm, category, t
         "processing_started",
         "classification_completed",
         "routing_decided",
+        "knowledge_retrieved",
     ]
     routing = events[-1]
     assert routing["ticket_id"] == ticket["id"]

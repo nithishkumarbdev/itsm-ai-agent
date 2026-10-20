@@ -382,11 +382,11 @@ def test_there_is_no_way_to_delete_or_replace_a_document(client, db):
     assert count(db) == 1
 
 
-# ---------- the ticket pipeline does not use the knowledge base yet ----------
+# ---------- ticket processing only retrieves from what has been indexed ----------
 
 
-def test_ticket_processing_is_unchanged_by_the_knowledge_base(client, llm):
-    create(client)  # a VPN guide exists
+def test_ticket_processing_retrieves_only_from_indexed_documents(client, llm):
+    create(client)  # a VPN guide exists, but it has not been indexed
     ticket = client.post(
         "/tickets",
         json={"source": "web", "requester": "user@example.com", "title": "VPN not connecting",
@@ -396,9 +396,11 @@ def test_ticket_processing_is_unchanged_by_the_knowledge_base(client, llm):
     body = client.post(f"/tickets/{ticket['id']}/process").json()
 
     events = [e["event_type"] for e in client.get(f"/tickets/{ticket['id']}/events").json()]
-    assert events == ["ticket_created", "status_changed", "processing_started", "classification_completed", "routing_decided"]
+    assert events == ["ticket_created", "status_changed", "processing_started", "classification_completed",
+                      "routing_decided", "knowledge_retrieved"]
     assert body["assigned_team"] == "Network"
-    for field in ["retrieved_documents", "suggested_resolution", "resolution_confidence", "auto_resolution_eligible"]:
+    assert body["retrieved_documents"] == []  # searched, but nothing is indexed yet
+    for field in ["suggested_resolution", "resolution_confidence", "auto_resolution_eligible"]:
         assert body[field] is None
     assert len(llm.calls) == 1  # classification only
     assert "Symptoms" not in llm.calls[0]["user"] + llm.calls[0]["system"]  # no knowledge text reaches the model

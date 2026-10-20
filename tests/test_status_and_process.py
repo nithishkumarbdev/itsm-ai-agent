@@ -139,6 +139,7 @@ def test_process_moves_ticket_to_processing_and_records_events(
         "processing_started",
         "classification_completed",  # added in Phase 3
         "routing_decided",  # added in Phase 4
+        "knowledge_retrieved",  # added in Phase 6
     ]
     events = client.get(f"/tickets/{ticket['id']}/events").json()
     started = next(e for e in events if e["event_type"] == "processing_started")
@@ -146,11 +147,10 @@ def test_process_moves_ticket_to_processing_and_records_events(
 
 
 def test_process_only_fills_classification_fields_not_later_phases(client, ticket):
-    """Classification and routing exist; retrieval, resolution and policy fields must stay empty."""
+    """Classification, routing and retrieval exist; resolution and policy fields must stay empty."""
     body = client.post(f"/tickets/{ticket['id']}/process").json()
 
     for field in [
-        "retrieved_documents",
         "suggested_resolution",
         "resolution_confidence",
         "auto_resolution_eligible",

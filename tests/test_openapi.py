@@ -10,6 +10,8 @@ EXPECTED_ENDPOINTS = {
     ("/knowledge", "post"),
     ("/knowledge/{document_id}", "get"),
     ("/knowledge/{document_id}", "patch"),
+    ("/knowledge/search", "post"),
+    ("/knowledge/{document_id}/index", "post"),
 }
 
 
@@ -23,6 +25,7 @@ def test_docs_and_openapi_are_served(client):
     # Exactly these endpoints: nothing extra. No DELETE anywhere, and no search/embed endpoints yet.
     actual = {(path, method) for path, operations in spec["paths"].items() for method in operations}
     assert actual == EXPECTED_ENDPOINTS
-    assert {"TicketCreate", "TicketRead", "StatusUpdate", "AuditEventRead", "KnowledgeDocumentCreate", "KnowledgeDocumentRead", "KnowledgeDocumentSummary", "KnowledgeDocumentUpdate"} <= set(
+    assert {"TicketCreate", "TicketRead", "StatusUpdate", "AuditEventRead", "KnowledgeDocumentCreate", "KnowledgeDocumentRead", "KnowledgeDocumentSummary", "KnowledgeDocumentUpdate",
+        "KnowledgeSearchRequest", "KnowledgeSearchResponse", "RetrievedChunkRead", "IndexResultRead"} <= set(
         spec["components"]["schemas"]
     )
