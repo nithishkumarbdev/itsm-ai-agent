@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_classification_service
+from app.api.deps import get_classification_service, get_retrieval_service
 from app.audit import record_event
 from app.db.database import get_db
 from app.lifecycle import change_status
@@ -12,6 +12,7 @@ from app.models import AuditEvent, AuditEventType, Ticket
 from app.schemas.audit_event import AuditEventRead
 from app.schemas.ticket import StatusUpdate, TicketCreate, TicketRead
 from app.services.classification import ClassificationService
+from app.services.retrieval import RetrievalService
 from app.workflow import run_processing
 
 router = APIRouter(prefix="/tickets", tags=["tickets"])
@@ -87,22 +88,27 @@ def process_ticket(
     ticket_id: uuid.UUID,
     db: Session = Depends(get_db),
     classifier: ClassificationService = Depends(get_classification_service),
+    retriever: RetrievalService = Depends(get_retrieval_service),
 ):
-    """Process a ticket: move it to `processing`, classify it with the LLM, then route it.
+    """Process a ticket: `processing`, then LLM classification, rule-based routing, and knowledge retrieval.
 
     The LLM only proposes the classification. The team (`assigned_team`) is chosen by
     deterministic backend rules from the validated category; clients cannot set it.
+    Retrieval then finds the internal knowledge most relevant to the ticket and stores
+    references to it in `retrieved_documents` (`[]` means nothing was relevant enough).
+    Retrieval provides evidence only: it does not change the routing or write an answer.
 
-    Success: the ticket is returned with its classification and `assigned_team`, and stays
-    in `processing`.
+    Success: the ticket is returned with its classification, team and retrieved references,
+    and stays in `processing`.
 
-    If classification (or routing) fails the response is still 200 with the ticket, but it
-    has no classification and no team, and its status is `awaiting_human`. The reason is in
-    the ticket's audit events (`classification_failed` / `routing_failed`).
-    Nothing else happens yet: no retrieval, no resolution.
+    If classification or routing fails, the response is still 200 but the ticket has no new
+    classification and its status is `awaiting_human`. If only retrieval fails, the valid
+    classification and routing are kept, `retrieved_documents` is null, and the status is
+    `awaiting_human`. The reason is in the audit events (`classification_failed`,
+    `routing_failed` or `retrieval_failed`). Nothing is resolved automatically.
     """
     ticket = get_ticket_or_404(db, ticket_id, lock=True)
-    return run_processing(db, ticket, classifier)
+    return run_processing(db, ticket, classifier, retriever)
 
 
 @router.get("/{ticket_id}/events", response_model=list[AuditEventRead], responses=NOT_FOUND)

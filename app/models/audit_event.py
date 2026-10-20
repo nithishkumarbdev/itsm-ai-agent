@@ -19,6 +19,8 @@ class AuditEventType(StrEnum):
     CLASSIFICATION_FAILED = "classification_failed"
     ROUTING_DECIDED = "routing_decided"
     ROUTING_FAILED = "routing_failed"
+    KNOWLEDGE_RETRIEVED = "knowledge_retrieved"
+    RETRIEVAL_FAILED = "retrieval_failed"
 
 
 class AuditEvent(Base):
