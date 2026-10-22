@@ -1,11 +1,15 @@
 """What happens when a ticket is processed.
 
-Today the steps are: start processing -> classify -> route -> retrieve knowledge.
-Later phases (resolution, guardrails) add their steps here, after retrieval.
+The steps are: start processing -> classify -> route -> retrieve knowledge -> generate a
+grounded resolution suggestion. Later phases (guardrails) add their steps here, after
+resolution.
 
-The LLM only *proposes* a classification. This module and the rules it calls decide what
-is saved: only a validated classification is written, the team comes from deterministic
-routing, retrieval only supplies evidence, and every outcome is audited.
+The LLM only *proposes*: a classification, and later a resolution suggestion. This module
+and the services it calls decide what is saved: only a validated classification is written,
+the team comes from deterministic routing, retrieval only supplies evidence, a resolution is
+only kept if every one of its cited sources was actually retrieved, and every outcome is
+audited. The ticket is never marked resolved and no action is ever executed: a suggestion is
+text for a human to review, not proof the issue is fixed.
 """
 
 import logging
@@ -15,11 +19,14 @@ from dataclasses import dataclass
 from sqlalchemy.orm import Session
 
 from app.audit import record_event
+from app.db.database import SessionLocal
 from app.embeddings.base import EmbeddingError
 from app.lifecycle import change_status
 from app.models import AuditEventType, Ticket, TicketStatus
 from app.schemas.classification import TicketClassification
+from app.schemas.resolution import TicketResolution
 from app.services.classification import ClassificationError, ClassificationService
+from app.services.resolution import ResolutionError, ResolutionService
 from app.services.retrieval import KnowledgeIndexError, RetrievalOutcome, RetrievalService, build_query
 from app.services.routing import RoutingDecision, route_ticket
 
@@ -38,7 +45,11 @@ class Failure:
 
 
 def run_processing(
-    db: Session, ticket: Ticket, classifier: ClassificationService, retriever: RetrievalService
+    db: Session,
+    ticket: Ticket,
+    classifier: ClassificationService,
+    retriever: RetrievalService,
+    resolver: ResolutionService,
 ) -> Ticket:
     """Process one ticket. `ticket` must already be loaded (and locked) by the caller.
 
@@ -46,30 +57,41 @@ def run_processing(
     or transaction is held while waiting for the LLM or the embedding model:
 
       1. new/awaiting_human/escalated -> processing (+ audit), commit
-      2. classify with the LLM, route by rules, embed the search query (no transaction open)
-      3. re-lock the ticket, save classification + team, search the knowledge index,
-         save the evidence, write all audit events, commit
+      2. classify with the LLM, route by rules, embed the search query, search the knowledge
+         index (its own short-lived session, unrelated to the ticket), and if evidence was
+         found, generate a resolution suggestion with the LLM (no transaction open on the
+         ticket at any point in this step)
+      3. re-lock the ticket, save classification + team + evidence + resolution, write all
+         audit events, commit
 
-    Failure handling: if classification or routing fails, nothing new is saved. If only
-    retrieval fails, the valid classification and routing are kept. Either way a failure
-    event is written and the ticket moves to awaiting_human (the lifecycle's "a person must
-    look at this" state, from which /process can be called again to retry).
+    Failure handling: if classification or routing fails, nothing new is saved. If retrieval
+    fails, the valid classification and routing are kept, and resolution is not attempted. If
+    only resolution fails, classification, routing and the retrieved evidence are kept.
+    Whenever something fails, a failure event is written and the ticket moves to
+    awaiting_human (the lifecycle's "a person must look at this" state, from which /process
+    can be called again to retry). When retrieval finds no relevant evidence at all,
+    resolution is skipped rather than attempted: no evidence means no invented answer, and
+    that is not treated as a failure.
     """
     # --- 1. start processing -------------------------------------------------------
     change_status(db, ticket, TicketStatus.PROCESSING)
     record_event(db, ticket.id, AuditEventType.PROCESSING_STARTED, "Ticket processing started")
     db.commit()
 
-    # --- 2. external work: classify, route, embed the query ------------------------
+    # --- 2. external work: classify, route, retrieve evidence, generate a resolution ---
     ticket_id = ticket.id
     title, description, source = ticket.title, ticket.description, ticket.source
     logger.info("classification started ticket=%s model=%s", ticket_id, classifier.llm_name)
     started = time.perf_counter()
+
     classification: TicketClassification | None = None
     decision: RoutingDecision | None = None
-    query_vector: list[float] | None = None
+    outcome: RetrievalOutcome | None = None
+    resolution: TicketResolution | None = None
     failure: Failure | None = None  # classification/routing failed: nothing new is saved
-    retrieval_failure: Failure | None = None  # retrieval failed: classification and routing are kept
+    retrieval_failure: Failure | None = None  # retrieval failed: classification/routing are kept
+    resolution_failure: Failure | None = None  # resolution failed: classification/routing/evidence are kept
+
     try:
         classification = classifier.classify(title=title, description=description, source=source)
     except ClassificationError as exc:
@@ -88,15 +110,46 @@ def run_processing(
                 {"exception": type(exc).__name__},
                 exc,
             )
+
     if failure is None:
         try:
             query_vector = retriever.embed_query(build_query(title, description))
+            # A separate, short-lived session: reading the knowledge index has nothing to do
+            # with the ticket's own transaction, and this keeps the main session free while
+            # the (potentially slow) resolution call below runs.
+            with SessionLocal() as scratch:
+                outcome = retriever.search(scratch, query_vector, category=classification.category.value)
         except EmbeddingError as exc:
             retrieval_failure = Failure(
                 AuditEventType.RETRIEVAL_FAILED,
                 f"Retrieval failed: {exc.kind}",
                 exc.kind,
                 {"provider_detail": exc.detail} if exc.detail else {},
+                exc,
+            )
+        except KnowledgeIndexError as exc:
+            retrieval_failure = Failure(
+                AuditEventType.RETRIEVAL_FAILED, "Retrieval failed: index_incompatible", "index_incompatible", {}, exc
+            )
+
+    if failure is None and retrieval_failure is None and outcome.results:
+        try:
+            resolution = resolver.generate(
+                title=title,
+                description=description,
+                source=source,
+                category=classification.category.value,
+                priority=classification.priority.value,
+                urgency=classification.urgency.value,
+                impact=classification.impact.value,
+                evidence=outcome.results,
+            )
+        except ResolutionError as exc:
+            resolution_failure = Failure(
+                AuditEventType.RESOLUTION_FAILED,
+                f"Resolution generation failed: {exc.kind}",
+                exc.kind,
+                exc.detail,
                 exc,
             )
     latency_ms = round((time.perf_counter() - started) * 1000)
@@ -115,29 +168,31 @@ def run_processing(
         _log_failure(ticket_id, failure, latency_ms)
     else:
         _save_result(db, ticket, classification, decision)
-        outcome: RetrievalOutcome | None = None
-        if retrieval_failure is None:
-            try:
-                outcome = retriever.search(db, query_vector, category=classification.category.value)
-            except KnowledgeIndexError as exc:
-                retrieval_failure = Failure(
-                    AuditEventType.RETRIEVAL_FAILED, "Retrieval failed: index_incompatible", "index_incompatible", {}, exc
-                )
-        if outcome is not None:
+        if retrieval_failure is not None:
+            _clear_retrieval_and_resolution(ticket)  # never leave evidence/resolution from an earlier run
+            _save_failure(db, ticket, retrieval_failure)
+            _log_failure(ticket_id, retrieval_failure, latency_ms)
+        else:
             _save_retrieval(db, ticket, classification.category.value, outcome)
+            if resolution_failure is not None:
+                _clear_resolution(ticket)  # never leave a resolution from an earlier run next to fresh evidence
+                _save_failure(db, ticket, resolution_failure)
+                _log_failure(ticket_id, resolution_failure, latency_ms)
+            elif resolution is not None:
+                _save_resolution(db, ticket, resolution, outcome.results)
+            else:
+                _clear_resolution(ticket)  # no evidence: nothing was generated, and nothing stale is kept either
             logger.info(
-                "processing completed ticket=%s category=%s team=%s confidence=%.2f retrieved=%d latency_ms=%d",
+                "processing completed ticket=%s category=%s team=%s confidence=%.2f retrieved=%d "
+                "resolution=%s latency_ms=%d",
                 ticket_id,
                 classification.category.value,
                 decision.assigned_team.value,
                 classification.confidence,
                 len(outcome.results),
+                "generated" if resolution is not None else ("failed" if resolution_failure else "skipped_no_evidence"),
                 latency_ms,
             )
-        else:
-            ticket.retrieved_documents = None  # never leave evidence from an earlier run next to a new classification
-            _save_failure(db, ticket, retrieval_failure)
-            _log_failure(ticket_id, retrieval_failure, latency_ms)
     db.commit()
     db.refresh(ticket)
     return ticket
@@ -208,6 +263,52 @@ def _save_retrieval(db: Session, ticket: Ticket, category: str, outcome: Retriev
             "documents": titles,
         },
     )
+
+
+def _save_resolution(db: Session, ticket: Ticket, resolution: TicketResolution, evidence: list) -> None:
+    """Store the suggested resolution and only the sources it actually cited, and audit it.
+
+    This never changes `status`: a suggestion is not proof the ticket is fixed, so the
+    ticket stays in `processing` for a person to review.
+    """
+    ticket.suggested_resolution = resolution.suggested_resolution
+    ticket.resolution_confidence = resolution.resolution_confidence
+    cited_ids = {str(ref.chunk_id) for ref in resolution.source_references}
+    cited = [chunk for chunk in evidence if str(chunk.chunk_id) in cited_ids]
+    ticket.resolution_sources = [
+        {
+            "document_id": str(chunk.document_id),
+            "document_title": chunk.document_title,
+            "chunk_id": str(chunk.chunk_id),
+            "chunk_index": chunk.chunk_index,
+        }
+        for chunk in cited
+    ]
+    record_event(
+        db,
+        ticket.id,
+        AuditEventType.RESOLUTION_GENERATED,
+        f"Resolution suggested, citing {len(cited)} source(s)"
+        if cited
+        else "Resolution suggested: evidence was insufficient",
+        {
+            "result_count": len(evidence),
+            "resolution_confidence": resolution.resolution_confidence,
+            "source_count": len(cited),
+            "reason": resolution.reason,
+        },
+    )
+
+
+def _clear_resolution(ticket: Ticket) -> None:
+    ticket.suggested_resolution = None
+    ticket.resolution_confidence = None
+    ticket.resolution_sources = None
+
+
+def _clear_retrieval_and_resolution(ticket: Ticket) -> None:
+    ticket.retrieved_documents = None  # never leave evidence from an earlier run next to a new classification
+    _clear_resolution(ticket)
 
 
 def _save_failure(db: Session, ticket: Ticket, failure: Failure) -> None:

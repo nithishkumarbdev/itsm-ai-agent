@@ -56,6 +56,8 @@ class Ticket(Base):
     retrieved_documents: Mapped[list | None] = mapped_column(JSON)
     suggested_resolution: Mapped[str | None] = mapped_column(Text)
     resolution_confidence: Mapped[float | None] = mapped_column(Float)
+    # Only the sources the model actually cited (a subset of retrieved_documents), for traceability.
+    resolution_sources: Mapped[list | None] = mapped_column(JSON)
 
     # --- policy / safety (NULL = not evaluated, which is different from False) ---
     auto_resolution_eligible: Mapped[bool | None] = mapped_column(Boolean)

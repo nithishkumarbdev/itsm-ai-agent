@@ -8,6 +8,7 @@ from app.embeddings.openai_compatible import OpenAICompatibleEmbeddings
 from app.llm.anthropic_client import AnthropicClient
 from app.llm.base import LLMClient
 from app.services.classification import ClassificationService
+from app.services.resolution import ResolutionService
 from app.services.retrieval import RetrievalService
 
 
@@ -50,3 +51,8 @@ def get_embedding_client() -> EmbeddingClient:
 
 def get_retrieval_service(embedder: EmbeddingClient = Depends(get_embedding_client)) -> RetrievalService:
     return RetrievalService(embedder, top_k=settings.retrieval_top_k, min_score=settings.retrieval_min_score)
+
+
+def get_resolution_service(llm: LLMClient = Depends(get_llm_client)) -> ResolutionService:
+    """Resolution generation reuses the same configured LLM as classification."""
+    return ResolutionService(llm)

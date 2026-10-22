@@ -72,6 +72,7 @@ class TicketRead(BaseModel):
     retrieved_documents: list | None
     suggested_resolution: str | None
     resolution_confidence: float | None
+    resolution_sources: list | None
 
     auto_resolution_eligible: bool | None
     guardrail_status: str | None

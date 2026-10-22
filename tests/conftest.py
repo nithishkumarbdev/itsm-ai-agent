@@ -35,13 +35,19 @@ from fastapi.testclient import TestClient  # noqa: E402
 from sqlalchemy import create_engine, select  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 
-from app.api.deps import get_embedding_client, get_llm_client, get_retrieval_service  # noqa: E402
+from app.api.deps import (  # noqa: E402
+    get_embedding_client,
+    get_llm_client,
+    get_resolution_service,
+    get_retrieval_service,
+)
 from app.db.database import Base, SessionLocal, engine, get_db  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import AuditEvent, KnowledgeDocument, Ticket  # noqa: E402
 from app.services.indexing import index_document  # noqa: E402
 from app.services.knowledge import seed_documents  # noqa: E402
 from app.services.knowledge_seed import load_seed_documents  # noqa: E402
+from app.services.resolution import ResolutionService  # noqa: E402
 from app.services.retrieval import RetrievalService  # noqa: E402
 
 
@@ -64,12 +70,26 @@ DEFAULT_CLASSIFICATION = {
 }
 
 
+# The name of the resolution schema (app.services.resolution.SCHEMA_NAME), duplicated here
+# rather than imported, so this mock has zero import-time dependency on that service module.
+SUBMIT_RESOLUTION_SCHEMA = "submit_resolution"
+
+DEFAULT_RESOLUTION_TEXT = (
+    "Follow the recommended troubleshooting steps from the retrieved internal knowledge below. "
+    "If the issue continues, contact the assigned team."
+)
+
+
 class MockLLMClient:
     """Stands in for the real LLM in every test. It is not part of the app on purpose,
-    so production code can never end up using fake classifications.
+    so production code can never end up using fake classifications or resolutions.
 
-    By default it returns a valid VPN classification. Tests change that with returns(),
-    returns_raw() or fails_with(), and inspect what the service sent via `calls`.
+    Classification and resolution calls are handled independently (they use different
+    schemas), so a test can make one fail or return custom data without touching the other:
+    - classification: returns(), returns_raw(), fails_with() (and `.error`/`.response` directly)
+    - resolution: returns_resolution(), returns_resolution_raw(), fails_resolution_with()
+    By default, classification returns a valid VPN classification and resolution cites the
+    first piece of retrieved evidence. `calls` records what was sent for both.
     """
 
     name = "mock"
@@ -78,6 +98,9 @@ class MockLLMClient:
         self.calls = []
         self.response = copy.deepcopy(DEFAULT_CLASSIFICATION)
         self.error = None
+        self.resolution_response = None  # None = derive a default at call time (see below)
+        self.resolution_overrides = {}
+        self.resolution_error = None
         self.before_return = None  # optional hook: runs while the "LLM call" is in progress
 
     def returns(self, **overrides):
@@ -91,12 +114,39 @@ class MockLLMClient:
     def fails_with(self, error):
         self.error = error
 
+    def returns_resolution(self, **overrides):
+        """Overrides applied on top of the auto-derived default resolution (see below)."""
+        self.resolution_overrides = overrides
+
+    def returns_resolution_raw(self, raw):
+        """Exactly this output for resolution calls, however malformed. Bypasses the default."""
+        self.resolution_response = raw
+
+    def fails_resolution_with(self, error):
+        self.resolution_error = error
+
     def generate_structured(self, *, system, user, schema_name, schema):
         self.calls.append(
             {"system": system, "user": user, "schema_name": schema_name, "schema": schema}
         )
         if self.before_return:
             self.before_return()
+        if schema_name == SUBMIT_RESOLUTION_SCHEMA:
+            if self.resolution_error:
+                raise self.resolution_error
+            if self.resolution_response is not None:
+                return copy.deepcopy(self.resolution_response)
+            # Default: cite the first retrieved chunk. The valid ids come from the schema
+            # itself (its enum), not from anything the test set up in advance, so this works
+            # for any ticket without the mock needing to know which chunks were retrieved.
+            valid_ids = schema["properties"]["source_references"]["items"]["properties"]["chunk_id"]["enum"]
+            default = {
+                "suggested_resolution": DEFAULT_RESOLUTION_TEXT,
+                "resolution_confidence": 0.92,
+                "source_references": [{"chunk_id": valid_ids[0]}] if valid_ids else [],
+                "reason": "Based on the retrieved internal knowledge for this ticket.",
+            }
+            return {**default, **self.resolution_overrides}
         if self.error:
             raise self.error
         return copy.deepcopy(self.response)
@@ -184,7 +234,12 @@ def retriever(embedder):
 
 
 @pytest.fixture()
-def client(llm, embedder, retriever):
+def resolver(llm):
+    return ResolutionService(llm)
+
+
+@pytest.fixture()
+def client(llm, embedder, retriever, resolver):
     """Client that uses the app's real database dependency, pointed at the test database,
     and the mock LLM instead of a real provider.
 
@@ -194,8 +249,9 @@ def client(llm, embedder, retriever):
     app.dependency_overrides[get_llm_client] = lambda: llm
     app.dependency_overrides[get_embedding_client] = lambda: embedder
     app.dependency_overrides[get_retrieval_service] = lambda: retriever
+    app.dependency_overrides[get_resolution_service] = lambda: resolver
     yield TestClient(app)
-    for dependency in (get_llm_client, get_embedding_client, get_retrieval_service):
+    for dependency in (get_llm_client, get_embedding_client, get_retrieval_service, get_resolution_service):
         app.dependency_overrides.pop(dependency, None)
 
 
@@ -208,7 +264,7 @@ def db():
 
 
 @pytest.fixture()
-def unreachable_client(llm, embedder, retriever):
+def unreachable_client(llm, embedder, retriever, resolver):
     """Client whose database is genuinely unreachable (nothing listens on port 1)."""
     dead_engine = create_engine(
         "postgresql+psycopg://nobody:nobody@127.0.0.1:1/nodb",
@@ -227,6 +283,7 @@ def unreachable_client(llm, embedder, retriever):
     app.dependency_overrides[get_llm_client] = lambda: llm
     app.dependency_overrides[get_embedding_client] = lambda: embedder
     app.dependency_overrides[get_retrieval_service] = lambda: retriever
+    app.dependency_overrides[get_resolution_service] = lambda: resolver
     yield TestClient(app)
     app.dependency_overrides.clear()
     dead_engine.dispose()

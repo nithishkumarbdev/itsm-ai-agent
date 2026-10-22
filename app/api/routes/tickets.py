@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_classification_service, get_retrieval_service
+from app.api.deps import get_classification_service, get_resolution_service, get_retrieval_service
 from app.audit import record_event
 from app.db.database import get_db
 from app.lifecycle import change_status
@@ -12,6 +12,7 @@ from app.models import AuditEvent, AuditEventType, Ticket
 from app.schemas.audit_event import AuditEventRead
 from app.schemas.ticket import StatusUpdate, TicketCreate, TicketRead
 from app.services.classification import ClassificationService
+from app.services.resolution import ResolutionService
 from app.services.retrieval import RetrievalService
 from app.workflow import run_processing
 
@@ -89,26 +90,35 @@ def process_ticket(
     db: Session = Depends(get_db),
     classifier: ClassificationService = Depends(get_classification_service),
     retriever: RetrievalService = Depends(get_retrieval_service),
+    resolver: ResolutionService = Depends(get_resolution_service),
 ):
-    """Process a ticket: `processing`, then LLM classification, rule-based routing, and knowledge retrieval.
+    """Process a ticket: `processing`, LLM classification, rule-based routing, knowledge
+    retrieval, and a grounded resolution suggestion.
 
-    The LLM only proposes the classification. The team (`assigned_team`) is chosen by
-    deterministic backend rules from the validated category; clients cannot set it.
-    Retrieval then finds the internal knowledge most relevant to the ticket and stores
-    references to it in `retrieved_documents` (`[]` means nothing was relevant enough).
-    Retrieval provides evidence only: it does not change the routing or write an answer.
+    The LLM only proposes: the classification, and separately a resolution suggestion. The
+    backend decides everything operational: the team (`assigned_team`) comes from
+    deterministic rules, not the LLM; the resolution is only kept if every source it cites was
+    actually retrieved for this ticket.
 
-    Success: the ticket is returned with its classification, team and retrieved references,
-    and stays in `processing`.
+    `suggested_resolution` is a suggestion for a person to review, never an executed action:
+    the ticket's status is never set to `resolved` by this endpoint, and nothing is changed
+    outside the ticket's own fields. If retrieval found no relevant evidence, no resolution is
+    generated at all (`suggested_resolution` stays null) rather than inventing one.
+
+    Success: the ticket is returned with its classification, team, retrieved references and
+    (if evidence was found and generation succeeded) a suggested resolution, and stays in
+    `processing`.
 
     If classification or routing fails, the response is still 200 but the ticket has no new
     classification and its status is `awaiting_human`. If only retrieval fails, the valid
     classification and routing are kept, `retrieved_documents` is null, and the status is
-    `awaiting_human`. The reason is in the audit events (`classification_failed`,
-    `routing_failed` or `retrieval_failed`). Nothing is resolved automatically.
+    `awaiting_human`. If only resolution generation fails, the valid classification, routing
+    and retrieved evidence are kept, `suggested_resolution` is null, and the status is
+    `awaiting_human`. The reason is always in the audit events (`classification_failed`,
+    `routing_failed`, `retrieval_failed` or `resolution_failed`).
     """
     ticket = get_ticket_or_404(db, ticket_id, lock=True)
-    return run_processing(db, ticket, classifier, retriever)
+    return run_processing(db, ticket, classifier, retriever, resolver)
 
 
 @router.get("/{ticket_id}/events", response_model=list[AuditEventRead], responses=NOT_FOUND)

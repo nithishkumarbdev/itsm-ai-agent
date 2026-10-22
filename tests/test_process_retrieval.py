@@ -61,12 +61,18 @@ def test_vpn_ticket_is_classified_routed_and_matched_to_the_vpn_guide(client, in
         assert reference["similarity_score"] >= 0.2
     assert row_of(ticket["id"]).retrieved_documents == references  # stored in PostgreSQL
 
+    assert body["suggested_resolution"]  # a suggestion, not an executed action
+    assert 0.0 <= body["resolution_confidence"] <= 1.0
+    sources = body["resolution_sources"]
+    assert sources and {s["chunk_id"] for s in sources} <= {r["chunk_id"] for r in references}  # only real evidence
+
     events = events_of(client, ticket["id"])
     assert types_of(events) == [
         "ticket_created", "status_changed", "processing_started",
-        "classification_completed", "routing_decided", "knowledge_retrieved",
+        "classification_completed", "routing_decided", "knowledge_retrieved", "resolution_generated",
     ]
-    assert events[-1]["details"] == {
+    retrieved = next(e for e in events if e["event_type"] == "knowledge_retrieved")
+    assert retrieved["details"] == {
         "result_count": len(references),
         "top_score": max(r["similarity_score"] for r in references),
         "category": "vpn",
@@ -74,7 +80,10 @@ def test_vpn_ticket_is_classified_routed_and_matched_to_the_vpn_guide(client, in
         "candidates_considered": 55,
         "documents": list(dict.fromkeys(r["document_title"] for r in references)),
     }
-    assert events[-1]["message"] == f"Retrieved {len(references)} knowledge chunk(s)"
+    assert retrieved["message"] == f"Retrieved {len(references)} knowledge chunk(s)"
+    generated = events[-1]
+    assert generated["details"]["source_count"] == len(sources)
+    assert generated["details"]["resolution_confidence"] == body["resolution_confidence"]
 
 
 def test_only_the_problem_is_searched_for_and_the_model_never_sees_the_knowledge(client, indexed_kb, llm, embedder):
@@ -84,16 +93,22 @@ def test_only_the_problem_is_searched_for_and_the_model_never_sees_the_knowledge
 
     assert embedder.calls == [[f"{VPN_TITLE}\n{VPN_DESCRIPTION}"]]  # title and description, nothing else
     assert ticket["id"] not in embedder.calls[0][0]
-    assert len(llm.calls) == 1  # classification only: no second LLM call to "use" the evidence
-    assert "Symptoms" not in llm.calls[0]["user"] + llm.calls[0]["system"]
+    assert len(llm.calls) == 2  # classification, then a separate resolution call using its evidence
+    classification_call, resolution_call = llm.calls
+    assert classification_call["schema_name"] == "submit_classification"
+    assert resolution_call["schema_name"] == "submit_resolution"
+    assert "Symptoms" not in classification_call["user"] + classification_call["system"]  # no KB text here
+    assert VPN_TITLE in resolution_call["user"] and "<evidence>" in resolution_call["user"]  # KB text only here
 
 
-def test_no_resolution_is_generated_and_nothing_is_automated(client, indexed_kb):
+def test_generating_a_resolution_never_auto_resolves_or_executes_anything(client, indexed_kb):
+    """A resolution is a suggestion for a person to review, not an action the system took."""
     body = process(client, create()["id"])
 
-    for field in ["suggested_resolution", "resolution_confidence", "auto_resolution_eligible", "guardrail_status"]:
+    assert body["suggested_resolution"]  # a suggestion was legitimately generated ...
+    assert body["status"] == "processing"  # ... but the ticket is never marked resolved by this
+    for field in ["auto_resolution_eligible", "guardrail_status"]:  # still fully unimplemented
         assert body[field] is None
-    assert body["status"] == "processing"
 
 
 def test_a_security_ticket_gets_evidence_but_is_only_routed_never_resolved(client, indexed_kb, llm):
@@ -105,8 +120,10 @@ def test_a_security_ticket_gets_evidence_but_is_only_routed_never_resolved(clien
     assert body["category"] == "security"
     assert body["assigned_team"] == "Security"
     assert body["retrieved_documents"][0]["document_title"] == "Suspected Account Compromise Guide"
-    assert body["status"] == "processing"
-    assert body["suggested_resolution"] is None and body["auto_resolution_eligible"] is None
+    assert body["status"] == "processing"  # never auto-resolved
+    assert body["suggested_resolution"]  # a suggestion, grounded in the security guide
+    assert body["resolution_sources"][0]["document_title"] == "Suspected Account Compromise Guide"
+    assert body["auto_resolution_eligible"] is None
 
 
 def test_retrieval_supplies_evidence_but_never_changes_the_routing(client, indexed_kb, llm):
@@ -223,7 +240,9 @@ def test_reprocessing_replaces_the_evidence_instead_of_adding_to_it(client, inde
     second = process(client, ticket["id"])["retrieved_documents"]
 
     assert second == first  # same evidence, not doubled
-    assert types_of(events_of(client, ticket["id"])).count("knowledge_retrieved") == 2  # both runs are in the history
+    events = types_of(events_of(client, ticket["id"]))
+    assert events.count("knowledge_retrieved") == 2  # both runs are in the history
+    assert events.count("resolution_generated") == 2  # a resolution is regenerated each run too, not doubled up
 
 
 def test_a_failed_reprocess_does_not_leave_old_evidence_next_to_a_new_classification(
@@ -238,7 +257,10 @@ def test_a_failed_reprocess_does_not_leave_old_evidence_next_to_a_new_classifica
 
     assert body["status"] == "awaiting_human"
     assert body["retrieved_documents"] is None
-    assert row_of(ticket["id"]).retrieved_documents is None
+    assert body["suggested_resolution"] is None and body["resolution_sources"] is None  # stale resolution cleared too
+    row = row_of(ticket["id"])
+    assert row.retrieved_documents is None
+    assert row.suggested_resolution is None and row.resolution_sources is None
 
 
 # ---------- transactions ----------
@@ -267,6 +289,31 @@ def test_no_database_lock_is_held_while_the_query_is_being_embedded(client, inde
     assert observed == ["row was free"]
 
 
+def test_no_database_lock_is_held_while_the_resolution_is_being_generated(client, indexed_kb, llm):
+    ticket = create()
+    observed = []
+
+    def during_resolution_call():
+        if llm.calls[-1]["schema_name"] != "submit_resolution":
+            return  # only check while the SECOND (resolution) call is in progress
+        session = SessionLocal()
+        try:
+            session.execute(
+                select(Ticket.id).where(Ticket.id == uuid.UUID(ticket["id"])).with_for_update(nowait=True)
+            )
+            observed.append("row was free")
+        except OperationalError:
+            observed.append("row was locked")
+        finally:
+            session.rollback()
+            session.close()
+
+    llm.before_return = during_resolution_call
+    process(client, ticket["id"])
+
+    assert observed == ["row was free"]
+
+
 def test_result_is_discarded_if_the_ticket_changed_while_the_query_was_being_embedded(
     client, indexed_kb, embedder, row_of
 ):
@@ -283,4 +330,7 @@ def test_result_is_discarded_if_the_ticket_changed_while_the_query_was_being_emb
 
     assert body["status"] == "resolved"  # their change stands
     assert body["category"] is None and body["retrieved_documents"] is None
-    assert not {"classification_completed", "knowledge_retrieved"} & set(types_of(events_of(client, ticket["id"])))
+    assert body["suggested_resolution"] is None
+    assert not {"classification_completed", "knowledge_retrieved", "resolution_generated"} & set(
+        types_of(events_of(client, ticket["id"]))
+    )

@@ -3,12 +3,14 @@
 AI automation for internal IT support (ITSM): ticket triage, RAG-grounded resolution,
 deterministic rules and guardrails, human escalation, and a full audit trail.
 
-**Status: Phase 6 (RAG retrieval).** Tickets are stored in PostgreSQL, move through a controlled
-lifecycle, every important change is audited, and `POST /tickets/{id}/process` classifies the
-ticket with an LLM, routes it to a team with deterministic backend rules, and retrieves the most
-relevant internal knowledge as evidence.
-**Phase 6 retrieves relevant knowledge but does not yet generate AI resolutions or perform any
-automatic action.** Resolution generation starts in Phase 7.
+**Status: Phase 7 (grounded resolution generation).** Tickets are stored in PostgreSQL, move
+through a controlled lifecycle, every important change is audited, and `POST /tickets/{id}/process`
+classifies the ticket with an LLM, routes it to a team with deterministic backend rules,
+retrieves the most relevant internal knowledge, and generates a suggested resolution grounded
+in that evidence.
+**A resolution is a suggestion for a person to review, never an executed action: the ticket is
+never marked resolved by this endpoint, and no action is ever performed.** Auto-resolution
+policy and guardrails start in Phase 8.
 This README will be expanded as phases are completed.
 
 ## Setup
@@ -47,7 +49,7 @@ The `tickets` and `audit_events` tables are created on startup if missing. API d
 | `GET /tickets` | List tickets, newest first (`limit`, `offset`) |
 | `GET /tickets/{id}` | One ticket, 404 if unknown |
 | `POST /tickets/{id}/status` | Change status, only if the lifecycle allows it (409 otherwise) |
-| `POST /tickets/{id}/process` | Start processing: `processing`, LLM classification, rule-based routing, knowledge retrieval |
+| `POST /tickets/{id}/process` | Start processing: `processing`, LLM classification, rule-based routing, retrieval, resolution suggestion |
 | `GET /tickets/{id}/events` | The ticket's audit history, oldest first |
 
 ## Ticket lifecycle
@@ -203,6 +205,49 @@ Indexing is explicit and never runs at startup, so the app starts without an emb
 **Tests never need a key.** They use a deterministic bag-of-words mock embedder (`tests/conftest.py`)
 with its own threshold (0.20). It matches on shared words, not meaning, so it proves the retrieval
 mechanics (ranking, threshold, staleness, wiring), not the quality of real embeddings.
+
+## Resolution generation
+
+    ticket + classification + retrieved evidence -> LLM -> structured output -> validation -> ticket
+
+After retrieval finds relevant knowledge, `app/services/resolution.py` asks the LLM for a
+resolution suggestion grounded in that evidence, reusing the same configured LLM client as
+classification (one provider, two separate prompts). **If retrieval found nothing relevant,
+resolution generation is not attempted at all** — no evidence means no invented answer, and
+that is not treated as a failure.
+
+The prompt sends the ticket, the backend's validated classification, and the retrieved
+chunks as three separate, escaped, labelled blocks (`<ticket>`, `<classification>`,
+`<evidence>`). The ticket is untrusted data; so, in the same way, is any imperative-sounding
+text inside a retrieved document — neither can redefine the model's task. The model must
+always write in suggestion language ("try", "check"), never claim the issue is fixed or that
+an action was performed, and never recommend disabling security controls.
+
+**Source references are constrained, then re-checked.** The JSON schema sent to the model
+limits `chunk_id` to an enum of exactly the chunk ids that were retrieved for this ticket, so
+a compliant model cannot even express a fabricated citation. The backend re-checks this
+anyway (defense in depth, in case a provider ignores the schema): any citation to a chunk that
+was not actually retrieved makes the whole resolution invalid, exactly like a bad category
+would fail classification.
+
+**What is stored.** `suggested_resolution` and `resolution_confidence` (the model's own stated
+confidence — a signal, not a validated probability, and not acted on yet) go straight onto the
+ticket. `resolution_sources` holds only the chunks the model actually cited (ids and titles, a
+subset of `retrieved_documents`, never the chunk text) for traceability. The `resolution_generated`
+audit event records the source count, confidence and the model's one-sentence `reason`. The
+model may legitimately cite nothing and say the evidence was insufficient — that is a
+successful, valid result (low confidence, empty `resolution_sources`), not a failure.
+
+**The ticket's status never changes because of a resolution.** It stays in `processing`,
+whether or not a resolution was generated: `suggested_resolution` is a draft for a person,
+not proof the issue is fixed, and no action is ever executed. If generation fails (bad
+provider output, a fabricated citation, a timeout), the previously valid classification,
+routing and retrieved evidence are kept, a `resolution_failed` event is written, and the
+ticket moves to `awaiting_human` for retry.
+
+Configuration is unchanged: resolution reuses `LLM_MODEL` / `LLM_API_KEY` from `.env`. Tests
+use the same mock LLM as classification, extended with its own resolution schema/response, so
+no key is needed. The mock's default resolution cites the first piece of retrieved evidence.
 
 ## Upgrading an existing database
 
