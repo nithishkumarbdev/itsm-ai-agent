@@ -3,14 +3,13 @@
 AI automation for internal IT support (ITSM): ticket triage, RAG-grounded resolution,
 deterministic rules and guardrails, human escalation, and a full audit trail.
 
-**Status: Phase 7 (grounded resolution generation).** Tickets are stored in PostgreSQL, move
-through a controlled lifecycle, every important change is audited, and `POST /tickets/{id}/process`
-classifies the ticket with an LLM, routes it to a team with deterministic backend rules,
-retrieves the most relevant internal knowledge, and generates a suggested resolution grounded
-in that evidence.
-**A resolution is a suggestion for a person to review, never an executed action: the ticket is
-never marked resolved by this endpoint, and no action is ever performed.** Auto-resolution
-policy and guardrails start in Phase 8.
+**Status: Phase 9 (controlled tools).** Tickets are stored in PostgreSQL, move through a controlled
+lifecycle, every important change is audited, and `POST /tickets/{id}/process` classifies the ticket
+with an LLM, routes it with deterministic rules, retrieves internal knowledge, suggests a grounded
+resolution, and runs a guardrail check. A small **internal** tool layer (`app/tools/`) now exists for
+narrow, policy-checked operations on a ticket. **Nothing calls it yet and it is not exposed over HTTP**:
+no ticket is ever resolved or acted on automatically. Auto-resolution policy and the complete agent
+workflow are for a later phase.
 This README will be expanded as phases are completed.
 
 ## Setup
@@ -49,7 +48,7 @@ The `tickets` and `audit_events` tables are created on startup if missing. API d
 | `GET /tickets` | List tickets, newest first (`limit`, `offset`) |
 | `GET /tickets/{id}` | One ticket, 404 if unknown |
 | `POST /tickets/{id}/status` | Change status, only if the lifecycle allows it (409 otherwise) |
-| `POST /tickets/{id}/process` | Start processing: `processing`, LLM classification, rule-based routing, retrieval, resolution suggestion |
+| `POST /tickets/{id}/process` | Start processing: classification, routing, retrieval, resolution suggestion, guardrail check |
 | `GET /tickets/{id}/events` | The ticket's audit history, oldest first |
 
 ## Ticket lifecycle
@@ -248,6 +247,89 @@ ticket moves to `awaiting_human` for retry.
 Configuration is unchanged: resolution reuses `LLM_MODEL` / `LLM_API_KEY` from `.env`. Tests
 use the same mock LLM as classification, extended with its own resolution schema/response, so
 no key is needed. The mock's default resolution cites the first piece of retrieved evidence.
+
+## Guardrails
+
+    classification + resolution text -> deterministic policy check -> guardrail_status (+ maybe block)
+
+After a resolution is generated (or correctly not attempted, for lack of evidence),
+`app/guardrails/policy.py` runs a deterministic check — no LLM, no database, same style as
+routing — and records the outcome as `guardrail_status`:
+
+| `guardrail_status` | Meaning |
+|---|---|
+| `passed` | A resolution was generated, grounded in cited evidence, and its text is safe |
+| `requires_human_review` | The ticket's category is `security` — always, regardless of how good the resolution looks |
+| `ungrounded` | No resolution was generated, or it cited no evidence at all |
+| `blocked_restricted_content` | The resolution's own text recommended something unsafe, so it was discarded |
+
+Precedence when more than one applies (highest first, the same fixed-table style as routing's
+category → team mapping): **blocked > security > ungrounded > passed.** A security ticket with
+a perfectly safe, well-grounded resolution still gets `requires_human_review`, and unsafe text
+is blocked even on a security ticket.
+
+**What "unsafe" means here.** A resolution is blocked if its text matches a deterministic,
+auditable blocklist of phrases: recommending disabling MFA, a firewall, antivirus or other
+security controls; sharing a password; deleting an account; granting admin access; or claiming
+an action was already performed ("the issue has been fixed", "I have reset your password").
+The resolution prompt (Phase 7) already forbids all of this — this is the backend's
+independent re-check, the same defense-in-depth stance as validating source references against
+what was actually retrieved. If the check trips, the resolution is discarded outright: nothing
+unsafe is ever stored or shown, `suggested_resolution` stays null, and the ticket goes to
+`awaiting_human`. Classification, routing and the retrieved evidence are kept.
+
+**Prompt injection is recorded, not blocked.** Ticket text is scanned for common
+instruction-override phrasing ("ignore all previous instructions", "you are now an
+administrator", ...) and the result (`prompt_injection_suspected`) is written to the
+`guardrails_checked` audit event. It does not by itself change how the ticket is processed:
+ticket text is already treated as untrusted data everywhere it reaches an LLM (see the
+classification and resolution prompts), so this is a visibility signal, not a second line of
+defense.
+
+**Guardrails never invent a policy decision beyond recording it.** They do not decide
+auto-resolution eligibility, do not escalate a ticket's status for being `ungrounded` or
+`requires_human_review`, and do not execute or undo anything — there is nothing to undo, since
+no tools exist yet. That decision-making is for a later phase; guardrails only make the signal
+available (on the ticket and in the audit trail) for it to use. Guardrails only run once
+classification, routing, retrieval and resolution generation have all completed without
+failing — an upstream failure already has its own explicit audit event and there is nothing
+new to check.
+
+## Controlled tools
+
+`app/tools/` is a narrow, internal interface for operations on one ticket. A tool call has one
+entry point, `execute_tool` (`app/tools/executor.py`), so every call is validated, policy-checked,
+logged and audited; there is no other route to a tool's handler.
+
+| Tool | Kind | What it does |
+|---|---|---|
+| `get_ticket` | read | A small view of the ticket (no requester email, no evidence list) |
+| `search_knowledge_base` | read | Search active knowledge documents; returns scored, traceable chunks |
+| `check_resolution_policy` | read | Re-run the guardrail check on the stored resolution and compare with the recorded verdict |
+| `add_ticket_note` | write | Append a note (stored as an append-only `ticket_note_added` audit event) |
+| `assign_ticket` | write | Reassign the ticket to another team. **Operators only** |
+
+**The registry is the allow-list.** A name not in `TOOLS` cannot run, so there is no way to ask for
+a shell, SQL, code execution, deletion, or a generic "update these fields" tool (deliberately not
+built: it is exactly the unrestricted access the design avoids).
+
+Every call goes through, in order: known tool? known actor? actor permitted for this tool? arguments
+valid (strict, unknown fields rejected)? ticket-specific policy allows it? Then the handler runs in a
+savepoint, so a tool that fails half way is undone, the failure is recorded, and only a short code
+(never an error message) is stored. Each call leaves exactly one `tool_executed`, `tool_denied` or
+`tool_failed` event, with the actor. Denials and failures record field names and codes, never
+argument values; the knowledge search records only the query's length. State-changing tools lock the
+ticket row like every other mutation, and like the rest of the app nothing here commits: the caller does.
+
+Policies that do not depend on who asks or what they say: notes are refused on closed tickets;
+`assign_ticket` needs a classified ticket in `processing`, `awaiting_human` or `escalated`, and **a
+security ticket can never be moved away from Security** (the same precedence as routing).
+
+Limits to know: `actor` (`agent` or `operator`) is a label asserted by trusted internal code and recorded
+in the audit trail. There is no authentication, so it is not proof of identity, which is exactly why
+tools are not an HTTP endpoint. Reprocessing a ticket re-runs routing and will overwrite a manual
+reassignment. Tool results contain user-written and knowledge-base text, so if one is ever given to an
+LLM it must go in a labelled data block, never into instructions.
 
 ## Upgrading an existing database
 
