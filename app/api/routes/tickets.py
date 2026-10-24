@@ -93,29 +93,39 @@ def process_ticket(
     resolver: ResolutionService = Depends(get_resolution_service),
 ):
     """Process a ticket: `processing`, LLM classification, rule-based routing, knowledge
-    retrieval, and a grounded resolution suggestion.
+    retrieval, a grounded resolution suggestion, and a guardrail safety check.
 
     The LLM only proposes: the classification, and separately a resolution suggestion. The
     backend decides everything operational: the team (`assigned_team`) comes from
     deterministic rules, not the LLM; the resolution is only kept if every source it cites was
-    actually retrieved for this ticket.
+    actually retrieved, and its text passes a deterministic safety check (guardrails) before
+    it is ever stored.
+
+    `guardrail_status` records the outcome of that check: `passed` (a resolution was generated,
+    grounded in real evidence, and its text is safe), `requires_human_review` (a security-
+    category ticket -- always, regardless of how good the resolution looks), `ungrounded` (no
+    resolution was generated, or it cited no evidence), or `blocked_restricted_content` (the
+    resolution's own text recommended something unsafe, so it was discarded). This is a policy
+    signal for a later phase to use when deciding auto-resolution eligibility; this endpoint
+    does not decide that itself, and no action is ever executed.
 
     `suggested_resolution` is a suggestion for a person to review, never an executed action:
-    the ticket's status is never set to `resolved` by this endpoint, and nothing is changed
-    outside the ticket's own fields. If retrieval found no relevant evidence, no resolution is
-    generated at all (`suggested_resolution` stays null) rather than inventing one.
+    the ticket's status is never set to `resolved` by this endpoint. If retrieval found no
+    relevant evidence, no resolution is generated at all (`suggested_resolution` stays null)
+    rather than inventing one.
 
-    Success: the ticket is returned with its classification, team, retrieved references and
-    (if evidence was found and generation succeeded) a suggested resolution, and stays in
-    `processing`.
+    Success: the ticket is returned with its classification, team, retrieved references,
+    `guardrail_status`, and (if evidence was found, generation succeeded, and guardrails did
+    not block it) a suggested resolution, and stays in `processing`.
 
     If classification or routing fails, the response is still 200 but the ticket has no new
     classification and its status is `awaiting_human`. If only retrieval fails, the valid
     classification and routing are kept, `retrieved_documents` is null, and the status is
-    `awaiting_human`. If only resolution generation fails, the valid classification, routing
-    and retrieved evidence are kept, `suggested_resolution` is null, and the status is
-    `awaiting_human`. The reason is always in the audit events (`classification_failed`,
-    `routing_failed`, `retrieval_failed` or `resolution_failed`).
+    `awaiting_human`. If resolution generation fails, or guardrails block the generated
+    resolution, the valid classification, routing and retrieved evidence are kept,
+    `suggested_resolution` is null, and the status is `awaiting_human`. The reason is always in
+    the audit events (`classification_failed`, `routing_failed`, `retrieval_failed`,
+    `resolution_failed`, or `guardrails_checked`).
     """
     ticket = get_ticket_or_404(db, ticket_id, lock=True)
     return run_processing(db, ticket, classifier, retriever, resolver)

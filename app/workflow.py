@@ -1,15 +1,18 @@
 """What happens when a ticket is processed.
 
 The steps are: start processing -> classify -> route -> retrieve knowledge -> generate a
-grounded resolution suggestion. Later phases (guardrails) add their steps here, after
-resolution.
+grounded resolution suggestion -> check guardrails. Later phases (auto-resolution policy,
+tools) add their steps here, after guardrails.
 
 The LLM only *proposes*: a classification, and later a resolution suggestion. This module
 and the services it calls decide what is saved: only a validated classification is written,
 the team comes from deterministic routing, retrieval only supplies evidence, a resolution is
-only kept if every one of its cited sources was actually retrieved, and every outcome is
-audited. The ticket is never marked resolved and no action is ever executed: a suggestion is
-text for a human to review, not proof the issue is fixed.
+only kept if every one of its cited sources was actually retrieved AND its text passes the
+guardrail checks, and every outcome is audited. The ticket is never marked resolved and no
+action is ever executed: a suggestion is text for a human to review, not proof the issue is
+fixed. `guardrail_status` records a safety/policy signal (grounded, security category,
+blocked) for later phases to use when deciding auto-resolution eligibility; this module does
+not make that eligibility decision itself.
 """
 
 import logging
@@ -21,6 +24,7 @@ from sqlalchemy.orm import Session
 from app.audit import record_event
 from app.db.database import SessionLocal
 from app.embeddings.base import EmbeddingError
+from app.guardrails.policy import GuardrailResult, GuardrailStatus, evaluate as evaluate_guardrails
 from app.lifecycle import change_status
 from app.models import AuditEventType, Ticket, TicketStatus
 from app.schemas.classification import TicketClassification
@@ -61,17 +65,21 @@ def run_processing(
          index (its own short-lived session, unrelated to the ticket), and if evidence was
          found, generate a resolution suggestion with the LLM (no transaction open on the
          ticket at any point in this step)
-      3. re-lock the ticket, save classification + team + evidence + resolution, write all
-         audit events, commit
+      3. re-lock the ticket, run the guardrail check on the resolution (if any), save
+         classification + team + evidence + resolution + guardrail_status, write all audit
+         events, commit
 
     Failure handling: if classification or routing fails, nothing new is saved. If retrieval
     fails, the valid classification and routing are kept, and resolution is not attempted. If
-    only resolution fails, classification, routing and the retrieved evidence are kept.
-    Whenever something fails, a failure event is written and the ticket moves to
+    resolution fails, classification, routing and the retrieved evidence are kept. If the
+    guardrail check blocks the resolution (its text recommends something unsafe), the same
+    happens: classification, routing and evidence are kept, but the resolution is discarded.
+    Whenever something fails or is blocked, an event is written and the ticket moves to
     awaiting_human (the lifecycle's "a person must look at this" state, from which /process
     can be called again to retry). When retrieval finds no relevant evidence at all,
     resolution is skipped rather than attempted: no evidence means no invented answer, and
-    that is not treated as a failure.
+    that is not treated as a failure — but it is still recorded as "ungrounded" through
+    guardrail_status, alongside every other completed run.
     """
     # --- 1. start processing -------------------------------------------------------
     change_status(db, ticket, TicketStatus.PROCESSING)
@@ -178,21 +186,38 @@ def run_processing(
                 _clear_resolution(ticket)  # never leave a resolution from an earlier run next to fresh evidence
                 _save_failure(db, ticket, resolution_failure)
                 _log_failure(ticket_id, resolution_failure, latency_ms)
-            elif resolution is not None:
-                _save_resolution(db, ticket, resolution, outcome.results)
             else:
-                _clear_resolution(ticket)  # no evidence: nothing was generated, and nothing stale is kept either
-            logger.info(
-                "processing completed ticket=%s category=%s team=%s confidence=%.2f retrieved=%d "
-                "resolution=%s latency_ms=%d",
-                ticket_id,
-                classification.category.value,
-                decision.assigned_team.value,
-                classification.confidence,
-                len(outcome.results),
-                "generated" if resolution is not None else ("failed" if resolution_failure else "skipped_no_evidence"),
-                latency_ms,
-            )
+                guardrail_result = evaluate_guardrails(
+                    category=classification.category.value,
+                    ticket_text=f"{title}\n{description}",
+                    resolution_text=resolution.suggested_resolution if resolution is not None else None,
+                    source_count=len(resolution.source_references) if resolution is not None else None,
+                )
+                if guardrail_result.status == GuardrailStatus.BLOCKED_RESTRICTED_CONTENT:
+                    _clear_resolution(ticket)  # the resolution's own text is unsafe: never store or show it
+                    _save_guardrail_block(db, ticket, guardrail_result)
+                    logger.error(
+                        "resolution blocked by guardrails ticket=%s reasons=%s",
+                        ticket_id, guardrail_result.blocked_reasons,
+                    )
+                else:
+                    if resolution is not None:
+                        _save_resolution(db, ticket, resolution, outcome.results)
+                    else:
+                        _clear_resolution(ticket)  # no evidence: nothing was generated, nothing stale is kept
+                    _save_guardrails_passed(db, ticket, guardrail_result)
+                    logger.info(
+                        "processing completed ticket=%s category=%s team=%s confidence=%.2f retrieved=%d "
+                        "resolution=%s guardrail_status=%s latency_ms=%d",
+                        ticket_id,
+                        classification.category.value,
+                        decision.assigned_team.value,
+                        classification.confidence,
+                        len(outcome.results),
+                        "generated" if resolution is not None else "skipped_no_evidence",
+                        guardrail_result.status.value,
+                        latency_ms,
+                    )
     db.commit()
     db.refresh(ticket)
     return ticket
@@ -300,10 +325,57 @@ def _save_resolution(db: Session, ticket: Ticket, resolution: TicketResolution, 
     )
 
 
+def _guardrail_details(result: GuardrailResult) -> dict:
+    return {
+        "status": result.status.value,
+        "security_category": result.security_category,
+        "grounded": result.grounded,
+        "prompt_injection_suspected": result.prompt_injection_suspected,
+    }
+
+
+def _save_guardrails_passed(db: Session, ticket: Ticket, result: GuardrailResult) -> None:
+    """Record the guardrail outcome for a resolution that was kept (or correctly not generated).
+
+    Does not change status: none of these outcomes (passed, ungrounded, or a security ticket
+    needing human review) are failures. They are policy signals for a later phase to act on.
+    """
+    ticket.guardrail_status = result.status.value
+    record_event(
+        db,
+        ticket.id,
+        AuditEventType.GUARDRAILS_CHECKED,
+        f"Guardrails: {result.status.value}",
+        _guardrail_details(result),
+    )
+
+
+def _save_guardrail_block(db: Session, ticket: Ticket, result: GuardrailResult) -> None:
+    """A resolution was generated but its text failed the safety check, so it is discarded.
+
+    Only one audit event is written (guardrails_checked, with the block reasons in its
+    details) rather than a second generic failure event: the guardrail check itself is
+    already the complete, specific explanation of what happened and why.
+    """
+    ticket.guardrail_status = result.status.value
+    record_event(
+        db,
+        ticket.id,
+        AuditEventType.GUARDRAILS_CHECKED,
+        "Guardrails blocked the generated resolution",
+        {**_guardrail_details(result), "blocked_reasons": result.blocked_reasons},
+    )
+    change_status(db, ticket, TicketStatus.AWAITING_HUMAN)
+
+
 def _clear_resolution(ticket: Ticket) -> None:
     ticket.suggested_resolution = None
     ticket.resolution_confidence = None
     ticket.resolution_sources = None
+    # guardrail_status describes the resolution outcome, so it is cleared here too. The two
+    # callers that then generate a fresh guardrail result (the passed and blocked paths)
+    # immediately set it again; only the resolution/retrieval FAILURE paths leave it cleared.
+    ticket.guardrail_status = None
 
 
 def _clear_retrieval_and_resolution(ticket: Ticket) -> None:

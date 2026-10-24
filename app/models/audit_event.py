@@ -23,6 +23,11 @@ class AuditEventType(StrEnum):
     RETRIEVAL_FAILED = "retrieval_failed"
     RESOLUTION_GENERATED = "resolution_generated"
     RESOLUTION_FAILED = "resolution_failed"
+    GUARDRAILS_CHECKED = "guardrails_checked"
+    TOOL_EXECUTED = "tool_executed"
+    TOOL_DENIED = "tool_denied"
+    TOOL_FAILED = "tool_failed"
+    TICKET_NOTE_ADDED = "ticket_note_added"
 
 
 class AuditEvent(Base):
