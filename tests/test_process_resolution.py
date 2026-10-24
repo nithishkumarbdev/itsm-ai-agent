@@ -7,7 +7,7 @@ import pytest
 
 from app.llm.base import LLMError
 
-RESOLUTION_FIELDS = ["suggested_resolution", "resolution_confidence", "resolution_sources"]
+RESOLUTION_FIELDS = ["suggested_resolution", "resolution_confidence", "resolution_sources", "guardrail_status"]
 
 
 def create(client, title, description):
@@ -69,9 +69,9 @@ def test_resolution_is_grounded_in_the_matching_guide(client, indexed_kb, llm, r
     events = events_of(client, ticket["id"])
     assert types_of(events) == [
         "ticket_created", "status_changed", "processing_started",
-        "classification_completed", "routing_decided", "knowledge_retrieved", "resolution_generated",
+        "classification_completed", "routing_decided", "knowledge_retrieved", "resolution_generated", "guardrails_checked",
     ]
-    generated = events[-1]
+    generated = events[-2]
     assert generated["details"]["source_count"] == len(sources)
     assert generated["details"]["resolution_confidence"] == body["resolution_confidence"]
     assert "reason" in generated["details"]
@@ -83,7 +83,8 @@ def test_no_action_is_executed_and_nothing_claims_the_issue_is_fixed(client, ind
     body = process(client, create(client, "VPN keeps disconnecting", "My VPN connects but disconnects every few minutes.")["id"])
 
     assert body["status"] == "processing"
-    assert body["auto_resolution_eligible"] is None and body["guardrail_status"] is None
+    assert body["auto_resolution_eligible"] is None
+    assert body["guardrail_status"] == "passed"  # grounded, safe, non-security
     assert body["assigned_team"] == "Network"  # unchanged by resolution
 
 
@@ -136,6 +137,7 @@ def test_the_model_citing_evidence_that_was_never_retrieved_is_rejected_end_to_e
 
     assert body["status"] == "awaiting_human"
     assert body["suggested_resolution"] is None and body["resolution_sources"] is None
+    assert body["guardrail_status"] is None  # never evaluated: there was no valid resolution to check
     # classification, routing and the real retrieval are still kept: only resolution failed
     assert body["category"] == "vpn" and body["assigned_team"] == "Network"
     assert body["retrieved_documents"]
@@ -160,9 +162,11 @@ def test_insufficient_evidence_is_a_valid_generated_resolution_not_a_failure(cli
     assert body["suggested_resolution"]
     assert body["resolution_confidence"] == 0.1
     assert body["resolution_sources"] == []  # searched its evidence, cited none
+    assert body["guardrail_status"] == "ungrounded"  # cited nothing, so it cannot count as grounded
     events = events_of(client, ticket["id"])
-    assert types_of(events)[-1] == "resolution_generated"
-    assert events[-1]["details"]["source_count"] == 0
+    assert types_of(events)[-2:] == ["resolution_generated", "guardrails_checked"]
+    generated = next(e for e in events if e["event_type"] == "resolution_generated")
+    assert generated["details"]["source_count"] == 0
 
 
 # ---------- malformed structured output ----------

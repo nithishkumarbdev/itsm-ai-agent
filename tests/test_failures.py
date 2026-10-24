@@ -76,14 +76,19 @@ def test_process_is_rolled_back_if_the_second_audit_event_fails(
 
 @pytest.mark.parametrize(
     "failing_event",
-    [AuditEventType.CLASSIFICATION_COMPLETED, AuditEventType.ROUTING_DECIDED, AuditEventType.KNOWLEDGE_RETRIEVED],
-    ids=["classification_completed-fails", "routing_decided-fails", "knowledge_retrieved-fails"],
+    [
+        AuditEventType.CLASSIFICATION_COMPLETED,
+        AuditEventType.ROUTING_DECIDED,
+        AuditEventType.KNOWLEDGE_RETRIEVED,
+        AuditEventType.GUARDRAILS_CHECKED,
+    ],
+    ids=["classification_completed-fails", "routing_decided-fails", "knowledge_retrieved-fails", "guardrails_checked-fails"],
 )
 def test_classification_routing_and_retrieval_are_saved_together_or_not_at_all(
     client, ticket, row_of, event_types_of, monkeypatch, failing_event
 ):
-    """Classification fields, team, retrieved evidence and their audit events commit in one
-    transaction: if any audit write fails, none of it is saved."""
+    """Classification fields, team, retrieved evidence, guardrail status and their audit events
+    commit in one transaction: if any audit write fails, none of it is saved."""
 
     def fail_only_for_one_event(db, ticket_id, event_type, message, details=None):
         if event_type == failing_event:
@@ -101,6 +106,7 @@ def test_classification_routing_and_retrieval_are_saved_together_or_not_at_all(
     assert row.category is None and row.classification_confidence is None  # nothing partial saved
     assert row.assigned_team is None  # no team without its classification, and vice versa
     assert row.retrieved_documents is None  # and no evidence without them
+    assert row.guardrail_status is None  # and no guardrail verdict without them
     assert event_types_of(ticket["id"]) == ["ticket_created", "status_changed", "processing_started"]
 
 

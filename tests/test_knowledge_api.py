@@ -397,7 +397,7 @@ def test_ticket_processing_retrieves_only_from_indexed_documents(client, llm):
 
     events = [e["event_type"] for e in client.get(f"/tickets/{ticket['id']}/events").json()]
     assert events == ["ticket_created", "status_changed", "processing_started", "classification_completed",
-                      "routing_decided", "knowledge_retrieved"]
+                      "routing_decided", "knowledge_retrieved", "guardrails_checked"]
     assert body["assigned_team"] == "Network"
     assert body["retrieved_documents"] == []  # searched, but nothing is indexed yet
     for field in ["suggested_resolution", "resolution_confidence", "auto_resolution_eligible"]:

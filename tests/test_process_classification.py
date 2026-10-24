@@ -84,6 +84,7 @@ def test_classification_completed_event_belongs_to_the_ticket_and_has_concise_de
         "classification_completed",
         "routing_decided",
         "knowledge_retrieved",
+        "guardrails_checked",
     ]
     completed = events[3]
     assert completed["ticket_id"] == ticket["id"]
@@ -147,13 +148,9 @@ def test_processing_never_resolves_or_decides_anything_beyond_routing(client, ro
     assert body["status"] == "processing"  # not resolved, however confident
     assert body["assigned_team"] == "Access Management"
     assert body["retrieved_documents"] == []  # retrieval ran; nothing is indexed in this test
-    for field in [
-        "suggested_resolution",
-        "resolution_confidence",
-        "auto_resolution_eligible",
-        "guardrail_status",
-    ]:
+    for field in ["suggested_resolution", "resolution_confidence", "auto_resolution_eligible"]:
         assert body[field] is None
+    assert body["guardrail_status"] == "ungrounded"  # ran to completion; no evidence means no resolution
     assert row_of(ticket["id"]).auto_resolution_eligible is None
 
 
@@ -178,6 +175,7 @@ def test_injection_text_in_a_ticket_is_sent_as_data_and_changes_nothing_else(cli
         "classification_completed",
         "routing_decided",
         "knowledge_retrieved",
+        "guardrails_checked",
     ]
 
 

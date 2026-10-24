@@ -69,7 +69,7 @@ def test_vpn_ticket_is_classified_routed_and_matched_to_the_vpn_guide(client, in
     events = events_of(client, ticket["id"])
     assert types_of(events) == [
         "ticket_created", "status_changed", "processing_started",
-        "classification_completed", "routing_decided", "knowledge_retrieved", "resolution_generated",
+        "classification_completed", "routing_decided", "knowledge_retrieved", "resolution_generated", "guardrails_checked",
     ]
     retrieved = next(e for e in events if e["event_type"] == "knowledge_retrieved")
     assert retrieved["details"] == {
@@ -107,8 +107,8 @@ def test_generating_a_resolution_never_auto_resolves_or_executes_anything(client
 
     assert body["suggested_resolution"]  # a suggestion was legitimately generated ...
     assert body["status"] == "processing"  # ... but the ticket is never marked resolved by this
-    for field in ["auto_resolution_eligible", "guardrail_status"]:  # still fully unimplemented
-        assert body[field] is None
+    assert body["auto_resolution_eligible"] is None  # still fully unimplemented
+    assert body["guardrail_status"] == "passed"  # grounded, safe, non-security
 
 
 def test_a_security_ticket_gets_evidence_but_is_only_routed_never_resolved(client, indexed_kb, llm):
@@ -124,6 +124,7 @@ def test_a_security_ticket_gets_evidence_but_is_only_routed_never_resolved(clien
     assert body["suggested_resolution"]  # a suggestion, grounded in the security guide
     assert body["resolution_sources"][0]["document_title"] == "Suspected Account Compromise Guide"
     assert body["auto_resolution_eligible"] is None
+    assert body["guardrail_status"] == "requires_human_review"  # security always needs a human, even when grounded
 
 
 def test_retrieval_supplies_evidence_but_never_changes_the_routing(client, indexed_kb, llm):
@@ -147,11 +148,13 @@ def test_no_relevant_knowledge_is_recorded_as_an_empty_list_not_a_random_guide(c
 
     assert body["retrieved_documents"] == []
     assert row_of(ticket["id"]).retrieved_documents == []  # [] means "searched, nothing relevant" (null means "not searched")
-    event = events_of(client, ticket["id"])[-1]
-    assert event["event_type"] == "knowledge_retrieved"
+    events = events_of(client, ticket["id"])
+    event = next(e for e in events if e["event_type"] == "knowledge_retrieved")
     assert event["message"] == "No sufficiently relevant knowledge found"
     assert event["details"]["result_count"] == 0 and event["details"]["top_score"] is None
     assert body["status"] == "processing"  # no escalation policy yet
+    assert body["guardrail_status"] == "ungrounded"  # no resolution was attempted: nothing to ground
+    assert events[-1]["event_type"] == "guardrails_checked"
 
 
 def test_an_empty_index_is_visible_as_zero_candidates(client, llm):
@@ -243,6 +246,7 @@ def test_reprocessing_replaces_the_evidence_instead_of_adding_to_it(client, inde
     events = types_of(events_of(client, ticket["id"]))
     assert events.count("knowledge_retrieved") == 2  # both runs are in the history
     assert events.count("resolution_generated") == 2  # a resolution is regenerated each run too, not doubled up
+    assert events.count("guardrails_checked") == 2  # guardrails are re-evaluated each run too
 
 
 def test_a_failed_reprocess_does_not_leave_old_evidence_next_to_a_new_classification(
@@ -258,9 +262,11 @@ def test_a_failed_reprocess_does_not_leave_old_evidence_next_to_a_new_classifica
     assert body["status"] == "awaiting_human"
     assert body["retrieved_documents"] is None
     assert body["suggested_resolution"] is None and body["resolution_sources"] is None  # stale resolution cleared too
+    assert body["guardrail_status"] is None  # cleared: no completed run to base a verdict on
     row = row_of(ticket["id"])
     assert row.retrieved_documents is None
     assert row.suggested_resolution is None and row.resolution_sources is None
+    assert row.guardrail_status is None
 
 
 # ---------- transactions ----------
