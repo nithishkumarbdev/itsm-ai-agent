@@ -3,13 +3,14 @@
 AI automation for internal IT support (ITSM): ticket triage, RAG-grounded resolution,
 deterministic rules and guardrails, human escalation, and a full audit trail.
 
-**Status: Phase 9 (controlled tools).** Tickets are stored in PostgreSQL, move through a controlled
-lifecycle, every important change is audited, and `POST /tickets/{id}/process` classifies the ticket
-with an LLM, routes it with deterministic rules, retrieves internal knowledge, suggests a grounded
-resolution, and runs a guardrail check. A small **internal** tool layer (`app/tools/`) now exists for
-narrow, policy-checked operations on a ticket. **Nothing calls it yet and it is not exposed over HTTP**:
-no ticket is ever resolved or acted on automatically. Auto-resolution policy and the complete agent
-workflow are for a later phase.
+**Status: Phase 10 (evaluation & reliability).** Tickets are stored in PostgreSQL, move through
+a controlled lifecycle, every important change is audited, and `POST /tickets/{id}/process`
+classifies, routes, retrieves, suggests a resolution, and checks guardrails. A small internal
+tool layer exists (`app/tools/`) but nothing calls it yet. A new, separate evaluation framework
+(`app/evaluation/`) now runs a representative dataset of tickets through the real pipeline and
+reports measured accuracy, retrieval recall, guardrail safety and tool-policy correctness --
+this is **reliability measurement**, not a new product feature; it changes nothing about how a
+ticket is processed.
 This README will be expanded as phases are completed.
 
 ## Setup
@@ -330,6 +331,80 @@ in the audit trail. There is no authentication, so it is not proof of identity, 
 tools are not an HTTP endpoint. Reprocessing a ticket re-runs routing and will overwrite a manual
 reassignment. Tool results contain user-written and knowledge-base text, so if one is ever given to an
 LLM it must go in a labelled data block, never into instructions.
+
+## Evaluation
+
+Unit tests answer "does this function behave correctly for this input?". Evaluation answers
+"how well does the whole AI pipeline perform across a representative set of tickets?" -- both
+are needed, and AI behavior can drift even when the application code around it does not change
+at all (a provider updates a model; a prompt gets tweaked).
+
+    python -m scripts.run_evaluation                      # deterministic mode, no API key needed
+    python -m scripts.run_evaluation --mode real           # the actual configured LLM/embedding provider
+    python -m scripts.run_evaluation --json-out report.json --save-baseline
+
+Every run creates real rows in whatever `DATABASE_URL` points to -- there is no separate
+evaluation database, the same as `scripts/seed_knowledge.py`. Point it at a database you do not
+mind seeing ~40 throwaway tickets added to.
+
+### The dataset
+
+`evaluation/cases/v1.yaml`: 43 cases across the required case types (standard, ambiguous,
+security, no-knowledge, prompt-injection, restricted-action, tool-action). Each case states
+only the properties it has a real opinion about -- a category, a team, a document that must be
+retrieved, a guardrail verdict -- never exact LLM wording, so the dataset stays meaningful as
+model output varies. The five AMBIGUOUS cases assert nothing at all: there is no defensible
+single ground truth for a genuinely vague ticket, so they exist to be observed in the JSON
+report, not graded.
+
+### Two modes, and what each one actually measures
+
+**`deterministic`** (default, no API key): classification comes from a small keyword matcher
+and resolutions from a fixed safe template (`app/evaluation/providers.py`), not a real LLM. It
+is deliberately **not** scripted to return each case's expected answer -- that would measure
+nothing, since a classifier told the right answer in advance can't be wrong. It classifies from
+the ticket's own words, the same way the embedder's bag-of-words hashing has no idea which
+document "should" match. This mode measures whether the **pipeline** wires together correctly
+(routing, retrieval, guardrails, tools); it does not and cannot measure classification or
+resolution **quality** -- the report says so explicitly, and `classification_accuracy` /
+`retrieval_recall_at_k` are reported honestly low where the keyword matcher is genuinely weak
+(see the dataset file's own notes on the security cases) rather than written around.
+
+**`real`**: the actual configured `LLM_MODEL` / `EMBEDDING_MODEL`. This is the only mode that
+measures classification and resolution quality against real model behavior.
+
+### Metrics
+
+Classification accuracy, routing accuracy, Retrieval Recall@K (does at least one acceptable
+document appear in what was retrieved), guardrail detection rate, guardrail false-positive rate
+(a safe case that was wrongly **blocked** -- not merely "ungrounded", which is a different,
+non-safety problem), prompt-injection detection rate, tool safety rate, and end-to-end success.
+**A metric with nothing eligible to measure it on is reported as "not measured", never as a
+fabricated 0%** -- the same principle used throughout the app (an empty retrieval result is
+`[]`, not an invented low score).
+
+### Baselines and regressions
+
+    python -m scripts.run_evaluation --save-baseline
+    python -m scripts.run_evaluation --check-regression evaluation/baselines/v1-deterministic.json
+
+A baseline is a saved `MetricsSummary` (`evaluation/baselines/`). `check_regression` compares a
+new run against it with a per-metric tolerance: how many percentage points a metric may drop
+before the run is considered a regression. Safety-relevant metrics (`routing_accuracy`,
+`guardrail_detection_rate`, `guardrail_false_positive_rate`, `tool_safety_rate`) get **zero**
+tolerance, since they are either deterministic or directly about what leaks past a safety
+check; retrieval and classification get a few points of slack, since small wording or dataset
+changes can move them slightly even with no real regression. The CLI exits 1 if the gate fails,
+0 otherwise, so it can be wired into CI later without any extra plumbing.
+
+### Traceability
+
+Every case's `CaseResult` records what was observed (category, team, retrieved documents,
+whether a resolution was generated, guardrail status, injection flag, tool outcome) and, on
+failure, a normalized stage (`CLASSIFICATION_ERROR`, `ROUTING_ERROR`, `RETRIEVAL_ERROR`,
+`GROUNDING_ERROR`, `RESOLUTION_ERROR`, `GUARDRAIL_ERROR`, `TOOL_ERROR`, `SYSTEM_ERROR`) with a
+specific reason -- never full prompts or hidden reasoning. `--json-out` writes the full
+structured result for every case, not just the summary.
 
 ## Upgrading an existing database
 
